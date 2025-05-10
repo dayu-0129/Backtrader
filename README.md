@@ -1,6 +1,7 @@
 # 1 Backtrader Multi-Factor Strategy with SVR
 
-This repository implements a cross-sectional multi-factor stock selection strategy using Support Vector Regression (SVR) and Backtrader.
+This repository contains two trading strategy implementations using Backtrader: a cross-sectional multi-factor stock selection strategy based on Support Vector Regression (SVR), and a technical indicator-based strategy using MACD crossover signals.
+
 
 ##  Strategy Overview
 
@@ -25,7 +26,7 @@ This repository implements a cross-sectional multi-factor stock selection strate
 ![image](https://github.com/user-attachments/assets/c573b5d0-2c0b-4042-b4f0-0c81a38be701)
 
 
-# MACD-Based Trading Strategy (Backtrader)
+# 2 MACD-Based Trading Strategy (Backtrader)
 
  MACD crossover strategy implemented using Backtrader
 
