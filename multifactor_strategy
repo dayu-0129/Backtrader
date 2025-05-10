@@ -1,0 +1,361 @@
+import time
+import math
+import datetime
+import numpy as np
+import pandas as pd
+import backtrader as bt
+from sklearn.svm import SVR
+
+from ast import literal_eval
+import matplotlib.pyplot as plt
+from backtrader.feeds import PandasData
+from sklearn.preprocessing import RobustScaler
+
+svr = SVR()
+# read all the factors data
+df_all = pd.read_csv('sp500_factors.csv')
+# to avoid 
+df_all['Date'] = pd.to_datetime(df_all['Date'], utc=True, errors='coerce')
+#remove timezone information
+
+df_all['Date'] = df_all['Date'].dt.tz_localize(None)
+
+
+cols = ['Open', 'High', 'Low', 'Close', 'Volume',
+        'momentum', 'bp', 'beta', 'market_cap', 'roe', 'turnover']
+
+start_date = pd.to_datetime(df_all['Date'].min())
+end_date = pd.to_datetime(df_all['Date'].max())
+all_dates = pd.date_range(start=start_date, end=end_date, freq='B')
+
+#set commission and stamp duty rate
+class stampDutyCommissionScheme(bt.CommInfoBase):
+    '''
+    Under this commission model, only commission is paid when buying stocks, 
+    commission and stamp duty are paid when selling stocks   
+    '''
+    params = (
+        ('stamp_duty', 0.001), 
+        ('commission', 0.0005), 
+        ('stocklike', True),
+        ('commtype', bt.CommInfoBase.COMM_PERC),
+        )
+ 
+    def _getcommission(self, size, price, pseudoexec):
+        '''
+        If size is greater than 0, this indicates a long / buying of shares.
+        If size is less than 0, it idicates a short / selling of shares.
+        '''
+        print('self.p.commission',self.p.commission)
+        if size > 0: # buy only commission
+            return  size * price * self.p.commission * 100
+        elif size < 0: # sell stamp duty and commission
+            return - size * price * (self.p.stamp_duty + self.p.commission*100)
+        else:
+            return 0 
+#strategy        
+class momentum_factor_strategy(bt.Strategy):
+    #adjust position each 5 days, hold 10 stocks each time
+
+    params = dict(
+        interval=5,
+        stocknum=10
+    )
+
+    def __init__(self):
+        self.df_all = df_all
+        self.df_all.sort_values(by=["Date", "ticker"], inplace=True)
+        self.dates = sorted(self.df_all["Date"].unique())
+        self.bar_num = 0
+        self.last = []
+        self.order_list = []
+        
+        
+        self.df_all["Date"] = pd.to_datetime(self.df_all["Date"], utc=True, errors="coerce")
+        self.df_all["Date"] = self.df_all["Date"].dt.tz_localize(None).dt.normalize()
+        
+        self.dates = sorted(self.df_all["Date"].dt.normalize().unique().tolist())
+
+    
+    def next(self):
+        
+        self.bar_num += 1
+        dt = pd.Timestamp(self.datas[0].datetime.date(0)).normalize()
+        
+        if dt not in self.dates:
+            return
+
+        should_rebalance = (self.bar_num % self.p.interval == 0) and (self.bar_num >= 3 * self.p.interval)
+
+        if not should_rebalance:
+            return
+
+
+        prev_date = self.dates[self.dates.index(dt) - self.p.interval]
+        
+
+        df_fac = self.get_df_fac(dt, prev=0)
+        df_fac_p = self.get_df_fac(prev_date, prev=0)
+        
+
+        if df_fac.empty or df_fac_p.empty:
+            
+            return
+        
+        # align index
+        df_fac = df_fac[df_fac.index.isin(df_fac_p.index)]
+        df_fac_p = df_fac_p[df_fac_p.index.isin(df_fac.index)]
+
+        
+        X_p = df_fac_p[["bp", "beta", "market_cap", "roe", "turnover"]]
+        X = df_fac[["bp", "beta", "market_cap", "roe", "turnover"]]
+        Y = df_fac[["momentum_value"]]
+        
+        if X_p.shape[0] < 5:
+            
+            return
+
+        rbX, rbY = RobustScaler(), RobustScaler()
+        X_p = rbX.fit_transform(X_p)
+        Y = rbY.fit_transform(Y)
+
+        svr = SVR()
+        #train svr model using last factor and current return 
+        svr.fit(X_p, np.ravel(Y))
+        #get future return prediction using current factor
+        svr_pred = svr.predict(rbX.transform(X))
+        pred_ret = rbY.inverse_transform(svr_pred.reshape(-1, 1)).ravel()
+
+        df_fac["pred"] = pred_ret
+        
+        #sort stocks using predction
+        df_fac = df_fac.sort_values("pred", ascending=False)
+        
+        #long stocks with positive futuren return prediction
+        #take the first stocknum stocks
+        df_fac_pos = df_fac[df_fac['pred']>0]
+        sort_list_pos = df_fac_pos['code'].tolist()
+        long_list=sort_list_pos[:self.p.stocknum]
+            
+        #short stocks with negative futuren return prediction
+        #take the first stocknum stocks
+        df_fac_neg = df_fac[df_fac['pred']<0]
+        sort_list_neg = df_fac_neg['code'].tolist()
+        short_list=sort_list_neg[-self.p.stocknum:]     
+             
+
+        #cancel previous invalid orders
+        for o in self.order_list:
+            self.cancel(o)
+        #reset order list
+            self.order_list = []  
+            
+        #close position of stocks not in current trading list but in previous list
+        for i in self.last:
+            if i not in long_list and i not in short_list:
+                d = self.getdatabyname(i)
+                o = self.close(data=d)
+                self.order_list.append(o)
+            
+        self.log('current calue %.2f' %(self.broker.getvalue()))
+            
+           
+        total_value = self.broker.getvalue()
+        print(f" current value: {total_value:.2f}")
+            
+            #buy long list stock
+        if len(long_list):
+        
+                
+            buypercentage = (1-0.05)/2/len(long_list)
+    
+               
+            targetvalue = buypercentage * total_value
+                
+                
+            for d in long_list:
+                data = self.getdatabyname(d)
+                    #calculate order volumn based on open price of next day order volumn is an integer multiple of 100
+                size = int(abs(targetvalue / data.open[1] // 100 * 100))
+                o = self.order_target_size(data=d, target=size)
+                               
+                self.order_list.append(o) 
+
+            #sell short list stocks                   
+        if len(short_list):
+                
+                #reserve 5% of the funds for commission and calculation error
+            buypercentage = (1-0.05)/2/len(short_list)
+    
+                
+            targetvalue = buypercentage * total_value
+                
+            for d in short_list:
+                data = self.getdatabyname(d)
+                    #calculate order volumn based on open price of next day order volumn is an integer multiple of 100
+                size = int(abs(targetvalue / data.open[1] // 100 * 100))
+                o = self.order_target_size(data=d, target=-size)
+                    #record order list            
+                self.order_list.append(o) 
+            
+            #track last order list
+        self.last = list(set(long_list).union(set(short_list)))  
+
+    def log(self, txt, dt=None):
+        dt = dt or self.datas[0].datetime.date(0)
+        print(f'{dt} {txt}')
+
+            
+
+         
+
+    def get_df_fac(self, date, prev=0):
+        try:
+            idx = self.dates.index(date) - self.p.interval * prev
+            if idx < 0:
+                return pd.DataFrame()
+            target_date = self.dates[idx]
+        except:
+            return pd.DataFrame()
+        
+
+        df_day = self.df_all[self.df_all["Date"] == target_date].copy()
+        if df_day.empty:
+            return pd.DataFrame()
+
+
+        df_day["momentum_value"] = df_day["momentum"]
+        df_fac = df_day[["ticker", "momentum_value", "bp", "beta", "market_cap", "roe", "turnover"]].copy()
+        df_fac.columns = ["code", "momentum_value", "bp", "beta", "market_cap", "roe", "turnover"]
+        df_fac.dropna(inplace=True)
+        df_fac.index = df_fac["code"]
+        
+
+        return df_fac
+        
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            # Buy/Sell order submitted/accepted to/by broker - Nothing to do
+            return
+
+        # Check if an order has been completed
+        # Attention: broker could reject order if not enougth cash
+        if order.status in [order.Completed, order.Canceled, order.Margin]:
+            if order.isbuy():
+                self.log(
+                    'BUY EXECUTED, Price: %.2f, Cost: %.2f, Comm %.2f, Size: %.2f, Stock: %s' %
+                    (order.executed.price,
+                     order.executed.value,
+                     order.executed.comm,
+                     order.executed.size,
+                     order.data._name))
+            else:  # Sell
+                self.log('SELL EXECUTED, Price: %.2f, Cost: %.2f, Comm %.2f, Size: %.2f, Stock: %s' %
+                        (order.executed.price,
+                         order.executed.value,
+                         order.executed.comm,
+                         order.executed.size,
+                         order.data._name))
+                
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            
+            self.log('TRADE PROFIT, GROSS %.2f, NET %.2f' %
+                     (trade.pnl, trade.pnlcomm))
+
+
+class SP500Data(bt.feeds.PandasData):
+    lines = ('momentum', 'bp', 'beta', 'market_cap', 'roe', 'turnover',)
+    params = (
+        ('datetime', None),   
+        ('open', 0),
+        ('high', 1),
+        ('low', 2),
+        ('close', 3),
+        ('volume', 4),
+        ('momentum', 5),
+        ('bp', 6),
+        ('beta', 7),
+        ('market_cap', 8),
+        ('roe', 9),
+        ('turnover', 10),
+    )
+
+#main
+# add stocks into cerebro
+tickers = df_all['ticker'].unique()
+cerebro = bt.Cerebro(stdstats=False)
+processed_list = []
+for ticker in df_all['ticker'].unique():
+    df_stock = df_all[df_all['ticker'] == ticker].copy()
+    df_stock.set_index('Date', inplace=True)
+    df_stock = df_stock.sort_index()
+
+    # date alignment
+    df_stock = df_stock.reindex(all_dates)
+    df_stock['ticker'] = ticker
+
+    df_stock.fillna(method='ffill', inplace=True)
+    df_stock.fillna(method='bfill', inplace=True)
+
+    df_stock = df_stock[cols]
+    
+    df_stock['code'] = ticker  
+    df_stock['Date'] = df_stock.index
+    processed_list.append(df_stock)
+
+    data_feed = SP500Data(
+        dataname=df_stock,
+        fromdate=start_date,
+        todate=end_date,
+        plot=False
+    )
+    cerebro.adddata(data_feed, name=ticker)
+#cerebro.broker = bt.brokers.BackBroker(shortcash=True)  # 0.5%
+#set stamp duty and commission 
+comminfo=stampDutyCommissionScheme(stamp_duty=0.001,commission=0.0005)
+cerebro.broker.addcommissioninfo(comminfo)
+
+cerebro.broker.setcash(1000000.0)
+#check if we have enough cash before order
+cerebro.broker.set_checksubmit(False)
+
+print('Starting Portfolio Value: %.2f' % cerebro.broker.getvalue())
+
+startcash=1000000.0
+cerebro.addstrategy(momentum_factor_strategy) 
+
+cerebro.addobserver(bt.observers.Value)
+
+#add analyzer
+cerebro.addanalyzer(
+    bt.analyzers.SharpeRatio,
+    riskfreerate=0.01,
+    annualize=True,
+    _name='sharp_ratio')
+cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
+
+thestrats = cerebro.run()
+
+thestrat = thestrats[0]
+#print result
+print('Sharpe Ratio:', thestrat.analyzers.sharp_ratio.get_analysis())
+print('DrawDown:', thestrat.analyzers.drawdown.get_analysis())
+
+print('Sharpe Ratio:',
+      thestrat.analyzers.sharp_ratio.get_analysis()['sharperatio'])
+print('Max DrawDown:',
+      thestrat.analyzers.drawdown.get_analysis()['max']['drawdown'])
+
+# print analyzer result
+for a in thestrat.analyzers:
+    a.print()
+cerebro.plot() 
+#get portfolio value
+portvalue = cerebro.broker.getvalue()
+pnl = portvalue - startcash
+
+print(f'total value: {round(portvalue,2)}')
+print(f'net gain value: {round(pnl,2)}')
